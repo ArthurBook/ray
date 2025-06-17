@@ -1,13 +1,16 @@
 import asyncio
 from concurrent.futures.thread import ThreadPoolExecutor
 from functools import partial
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import httpx
 import pytest
 from starlette.responses import StreamingResponse
 
+import ray
 from ray import serve
+from ray._common.test_utils import SignalActor, wait_for_condition
+from ray.serve.batching import _RuntimeSummaryStatistics
 
 
 def test_batching(serve_instance):
@@ -216,17 +219,19 @@ async def test_observability_helpers():
         * _get_handling_task_stack: returns the stack for the batch-handler task.
     """
 
+    signal_actor = SignalActor.remote()
+
     @serve.deployment(name="batcher")
     class Batcher:
         @serve.batch(max_batch_size=3)
         async def handle_batch(self, requests):
-            await asyncio.sleep(1)
+            await signal_actor.wait.remote()  # wait until the outer signal actor is released
             return [0] * len(requests)
 
         async def __call__(self, request):
             return await self.handle_batch(request)
 
-        async def _get_curr_iteration_start_times(self) -> Dict[asyncio.Task, float]:
+        async def _get_curr_iteration_start_times(self) -> _RuntimeSummaryStatistics:
             return self.handle_batch._get_curr_iteration_start_times()
 
         async def _is_batching_task_alive(self) -> bool:
@@ -241,20 +246,19 @@ async def test_observability_helpers():
     assert await handle._is_batching_task_alive.remote()
 
     async with httpx.AsyncClient() as client:
-        task = asyncio.create_task(client.get("http://localhost:8000/"))
-        await asyncio.sleep(0.1)  # yield control to the above task
-        prev_iter_times = await handle._get_curr_iteration_start_times.remote()
-        await task
+        asyncio.create_task(client.get("http://localhost:8000/"))
+    wait_for_condition(lambda: ray.get(signal_actor.cur_num_waiters.remote()) == 1)
+    prev_iter_times = await handle._get_curr_iteration_start_times.remote()
+    await signal_actor.send.remote()  # unblock the batch handler now that we have the iter times
 
     assert len(await handle._get_handling_task_stack.remote()) is not None
     assert await handle._is_batching_task_alive.remote()
 
     async with httpx.AsyncClient() as client:
-        futures = [client.get("http://localhost:8000/") for _ in range(5)]
-        tasks = [asyncio.create_task(future) for future in futures]
-        await asyncio.sleep(0.1)  # yield control to the above tasks
-        new_iter_times = await handle._get_curr_iteration_start_times.remote()
-        await asyncio.gather(*tasks)
+        asyncio.create_task(client.get("http://localhost:8000/"))
+    wait_for_condition(lambda: ray.get(signal_actor.cur_num_waiters.remote()) == 1)
+    new_iter_times = await handle._get_curr_iteration_start_times.remote()
+    await signal_actor.send.remote()  # unblock the batch handler now that we have the iter times
 
     assert new_iter_times.min_start_time > prev_iter_times.max_start_time
     assert len(await handle._get_handling_task_stack.remote()) is not None
